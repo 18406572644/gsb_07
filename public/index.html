@@ -86,7 +86,13 @@
 const $ = (id) => document.getElementById(id);
 let ws = null, me = null, currentRoom = null;
 const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
-let reconnectDelay = 500, ackTimer = null, retryTimer = null;
+let reconnectDelay = 500;
+let reconnectTimer = null;   // 断线重连定时器（可取消）
+let ackTimer = null;         // ACK 批量上报定时器
+let retryTimer = null;       // 未 ACK 消息重发扫描定时器
+let membersTimer = null;     // 成员列表周期刷新定时器
+let loggedIn = false;        // 是否已登录；登出/页面卸载前为 true
+let manualClose = false;    // 主动关闭（页面卸载等）后不再重连
 
 const store = {
   key: () => 'chat:' + me.name,
@@ -111,6 +117,51 @@ async function login(name) {
   return res.json();
 }
 
+/** 取消挂起的重连（幂等） */
+function cancelReconnect() {
+  if (reconnectTimer !== null) {
+    clearTimeout(reconnectTimer);
+    reconnectTimer = null;
+  }
+}
+
+/** 登录成功后启动的周期性任务：ACK 扫描与成员刷新 */
+function startTimers() {
+  if (retryTimer === null) {
+    // 未 ACK 的消息每秒重发一次（clientMsgId 不变，服务端幂等）
+    retryTimer = setInterval(() => {
+      if (!ws || ws.readyState !== 1) return; // 断线期间不扫描，重连后由 pending 继续兜底
+      for (const [roomId, r] of rooms) {
+        for (const [cid, p] of r.pending) {
+          if (!p.acked && Date.now() - p.sentAt > 1000) {
+            p.sentAt = Date.now();
+            send({ type: 'msg', roomId, clientMsgId: cid, content: p.content });
+          }
+        }
+      }
+    }, 1000);
+  }
+  if (membersTimer === null) membersTimer = setInterval(refreshMembers, 5000);
+}
+
+/**
+ * 生命周期清理（幂等）：停止全部定时器与挂起重连，摘除事件并关闭 socket。
+ * 页面卸载等主动终止路径只执行一次，避免旧 ws 与房间状态被回调长期持有。
+ */
+function cleanup() {
+  manualClose = true;
+  cancelReconnect();
+  if (ackTimer !== null) { clearTimeout(ackTimer); ackTimer = null; }
+  if (retryTimer !== null) { clearInterval(retryTimer); retryTimer = null; }
+  if (membersTimer !== null) { clearInterval(membersTimer); membersTimer = null; }
+  if (ws) {
+    ws.onopen = ws.onmessage = ws.onclose = ws.onerror = null;
+    try { ws.close(); } catch { /* 已关闭 */ }
+    ws = null;
+  }
+  loggedIn = false;
+}
+
 function connect() {
   ws = new WebSocket(`ws://${location.host}/ws?token=${encodeURIComponent(me.token)}`);
   ws.onopen = () => {
@@ -123,8 +174,13 @@ function connect() {
   };
   ws.onmessage = (ev) => handle(JSON.parse(ev.data));
   ws.onclose = () => {
+    if (manualClose) return; // 主动清理后不再重连
     setStatus('off', `已断开，${reconnectDelay}ms 后重连…`);
-    setTimeout(connect, reconnectDelay);
+    cancelReconnect(); // 同一时刻只允许存在一个挂起重连，回调不堆积
+    reconnectTimer = setTimeout(() => {
+      reconnectTimer = null;
+      connect();
+    }, reconnectDelay);
     reconnectDelay = Math.min(reconnectDelay * 2, 10000);
   };
   ws.onerror = () => ws.close();
@@ -166,6 +222,7 @@ function handle(m) {
       const r = rooms.get(m.roomId); if (!r) break;
       const p = r.pending.get(m.clientMsgId);
       if (p) p.acked = true;
+      r.pending.delete(m.clientMsgId); // 已确认：从重发映射摘除，避免条目永驻被每秒扫描
       const own = r.msgs.find((x) => x.clientMsgId === m.clientMsgId);
       if (own) { own.pending = false; own.seq = m.seq; }
       render();
@@ -187,32 +244,24 @@ function handle(m) {
     case 'error':
       sys(currentRoom, `错误 [${m.code}] ${m.message}`);
       break;
-    case 'server_shutdown': sys(currentRoom, '服务器即将重启…'); break;
+    case 'server_shutdown':
+      // 服务停止：onclose 将进入退避重连链（单链、可取消），服务重启后透明恢复
+      sys(currentRoom, '服务器即将重启…');
+      break;
   }
 }
 
 function scheduleAck() {
-  if (ackTimer) return;
+  if (ackTimer !== null) return;
   ackTimer = setTimeout(() => {
     ackTimer = null;
     for (const [id, r] of rooms) if (r.lastSeenSeq > 0) send({ type: 'ack', roomId: id, seq: r.lastSeenSeq });
   }, 500);
 }
 
-function refreshMembers() { if (currentRoom) send({ type: 'members', roomId: currentRoom }); }
-setInterval(refreshMembers, 5000);
-
-// 未 ACK 的消息每秒重发一次（clientMsgId 不变，服务端幂等）
-retryTimer = setInterval(() => {
-  for (const [roomId, r] of rooms) {
-    for (const [cid, p] of r.pending) {
-      if (!p.acked && Date.now() - p.sentAt > 1000) {
-        p.sentAt = Date.now();
-        send({ type: 'msg', roomId, clientMsgId: cid, content: p.content });
-      }
-    }
-  }
-}, 1000);
+function refreshMembers() {
+  if (loggedIn && currentRoom) send({ type: 'members', roomId: currentRoom });
+}
 
 function sys(roomId, text) {
   const r = rooms.get(roomId); if (!r) return;
@@ -293,8 +342,14 @@ $('loginForm').onsubmit = async (e) => {
   $('loginForm').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
   $('who').textContent = `${me.name} (${me.userId})`;
+  loggedIn = true;
+  manualClose = false;
+  startTimers();
   connect();
 };
+
+// 页面卸载：统一清理定时器、挂起重连与 socket，杜绝旧连接状态滞留
+window.addEventListener('pagehide', cleanup);
 
 $('createForm').onsubmit = (e) => {
   e.preventDefault();

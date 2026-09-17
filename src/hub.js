@@ -21,6 +21,7 @@ class Connection {
     this.rooms = new Set(); // 本连接已加入的房间
     this.unacked = new Map();
     this.unackedCount = 0;
+    this.disposed = false; // 生命周期守卫：所有终止路径仅清理一次
   }
 
   trackUnacked(roomId, seq, frame) {
@@ -89,7 +90,17 @@ class Hub {
     set.add(conn);
   }
 
+  /**
+   * 连接生命周期的唯一清理收敛点（幂等）。
+   * 正常 close、心跳 terminate、ACK 超时/背压 close、服务停止等所有终止路径最终
+   * 都走到这里：摘除索引、清空房间与未 ACK 状态、移除 ws 上的全部业务监听器
+   * （监听器闭包持有 conn，不移除会连同 ws 一起泄漏），最后断开 conn -> ws 引用。
+   * 多次调用安全：disposed 守卫保证清理仅执行一次。
+   */
   remove(conn) {
+    if (conn.disposed) return;
+    conn.disposed = true;
+
     this.all.delete(conn);
     const mine = this.byUser.get(conn.userId);
     if (mine) {
@@ -100,6 +111,25 @@ class Hub {
     conn.rooms.clear();
     conn.unacked.clear();
     conn.unackedCount = 0;
+
+    const ws = conn.ws;
+    if (ws && conn.listeners) {
+      // 只能精确摘除本服务挂载的处理器：ws 库自身在 WebSocket 上注册了内部
+      // 'close' 监听器（维护 wss.clients、触发 wss close），removeAllListeners
+      // 会误删它导致服务端无法正常关闭。
+      const { pong, message, close, error } = conn.listeners;
+      ws.removeListener('pong', pong);
+      ws.removeListener('message', message);
+      ws.removeListener('close', close);
+      ws.removeListener('error', error);
+      conn.listeners = null;
+    }
+    if (ws) conn.ws = null; // 释放底层 WebSocket 对象，等待 GC
+  }
+
+  /** 服务停止时兜底清理全部连接（ws 的终止由调用方负责） */
+  disposeAll() {
+    for (const conn of [...this.all]) this.remove(conn);
   }
 
   joinRoom(conn, roomId) {
@@ -142,14 +172,15 @@ class Hub {
    * 背压：未确认积压超过上限时断开连接（客户端重连后走 sync 补发）。
    */
   send(conn, frame, { track = false, roomId = null, seq = null } = {}) {
-    if (conn.ws.readyState !== 1 /* OPEN */) return false;
+    const ws = conn.ws;
+    if (!ws || ws.readyState !== 1 /* OPEN */) return false;
     if (track && conn.unackedCount >= this.config.maxUnackedPerConn) {
-      conn.ws.close(1013, 'backpressure: too many unacked messages');
+      ws.close(1013, 'backpressure: too many unacked messages');
       return false;
     }
     const str = typeof frame === 'string' ? frame : JSON.stringify(frame);
     try {
-      conn.ws.send(str);
+      ws.send(str);
     } catch {
       return false;
     }
@@ -169,16 +200,18 @@ class Hub {
     return delivered;
   }
 
-  /** 心跳扫描：超时未 pong 的连接直接 terminate（触发 close 走正常清理） */
+  /** 心跳扫描：超时未 pong 的连接直接 terminate（触发 close 走统一清理） */
   heartbeatSweep() {
     const t = now();
     for (const conn of this.all) {
+      const ws = conn.ws;
+      if (conn.disposed || !ws) continue; // 清理可能在扫描途中发生
       if (t - conn.lastPong > this.config.heartbeatTimeoutMs) {
-        conn.ws.terminate();
+        ws.terminate();
         continue;
       }
       try {
-        conn.ws.ping();
+        ws.ping();
       } catch { /* 连接已损坏，等待 close 事件清理 */ }
     }
   }
@@ -187,6 +220,7 @@ class Hub {
   resendSweep() {
     const { ackResendAfterMs, ackMaxResend } = this.config;
     for (const conn of this.all) {
+      if (conn.disposed || !conn.ws) continue;
       for (const entry of conn.pendingResends(ackResendAfterMs)) {
         entry.tries++;
         if (entry.tries > ackMaxResend) {
