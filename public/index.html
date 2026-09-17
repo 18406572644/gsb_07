@@ -74,28 +74,22 @@
   <div id="members" class="hidden"></div>
 </main>
 
+<script src="client.js"></script>
 <script>
 'use strict';
-/* 可靠投递客户端协议实现：
- * - 发送：每条消息带唯一 clientMsgId，未收到 ACK 定时重发（服务端幂等去重）；
- * - 接收：按房间记录 lastSeenSeq，seq 小于等于它的一律丢弃（幂等消费）；
- * - ACK：累积确认，500ms 批量上报；
- * - 断线补发：重连后重新 join 并携带 lastSeenSeq，服务端回放缺口；
- * - lastSeenSeq 存 localStorage，刷新页面也不丢进度。
+/*
+ * DOM 引导层：协议逻辑（连接、重连、ACK、重发、成员刷新、会话生命周期）
+ * 全部在 client.js 的 ChatRealtime.ChatSession 中；本文件只负责渲染与事件转发。
+ * 页面卸载（beforeunload/pagehide）时调用 session.shutdown() 做一次性清理。
  */
+const { ChatSession } = window.ChatRealtime;
 const $ = (id) => document.getElementById(id);
-let ws = null, me = null, currentRoom = null;
-const rooms = new Map(); // roomId -> {name, role, mutedUntil, lastSeenSeq, msgs:[], pending:Map}
-let reconnectDelay = 500, ackTimer = null, retryTimer = null;
+let me = null, session = null;
 
 const store = {
   key: () => 'chat:' + me.name,
   load() { try { return JSON.parse(localStorage.getItem(this.key())) || {}; } catch { return {}; } },
-  save() {
-    const o = {};
-    for (const [id, r] of rooms) o[id] = { name: r.name, lastSeenSeq: r.lastSeenSeq };
-    localStorage.setItem(this.key(), JSON.stringify(o));
-  },
+  save(snap) { localStorage.setItem(this.key(), JSON.stringify(snap)); },
 };
 
 function setStatus(cls, text) {
@@ -111,127 +105,28 @@ async function login(name) {
   return res.json();
 }
 
-function connect() {
-  ws = new WebSocket(`ws://${location.host}/ws?token=${encodeURIComponent(me.token)}`);
-  ws.onopen = () => {
-    setStatus('on', '已连接'); reconnectDelay = 500;
-    // 重连后恢复所有房间：携带本地进度，服务端补发缺口
-    const saved = store.load();
-    for (const [roomId, info] of Object.entries(saved)) {
-      ws.send(JSON.stringify({ type: 'join', room: roomId, lastSeq: info.lastSeenSeq || 0 }));
-    }
-  };
-  ws.onmessage = (ev) => handle(JSON.parse(ev.data));
-  ws.onclose = () => {
-    setStatus('off', `已断开，${reconnectDelay}ms 后重连…`);
-    setTimeout(connect, reconnectDelay);
-    reconnectDelay = Math.min(reconnectDelay * 2, 10000);
-  };
-  ws.onerror = () => ws.close();
-}
+// ---------------------------------------------------------------- 渲染
 
-function send(obj) { if (ws && ws.readyState === 1) ws.send(JSON.stringify(obj)); }
-
-function handle(m) {
-  switch (m.type) {
-    case 'welcome': break;
-    case 'joined': {
-      const saved = store.load();
-      const r = rooms.get(m.roomId) || { msgs: [], pending: new Map(), lastSeenSeq: 0 };
-      r.name = m.name; r.role = m.role; r.mutedUntil = m.mutedUntil;
-      r.lastSeenSeq = Math.max(r.lastSeenSeq, saved[m.roomId]?.lastSeenSeq || 0);
-      rooms.set(m.roomId, r);
-      if (!currentRoom) currentRoom = m.roomId;
-      renderRooms(); render(); refreshMembers();
-      break;
-    }
-    case 'msg': {
-      const r = rooms.get(m.roomId); if (!r) break;
-      if (m.seq <= r.lastSeenSeq) break;          // 幂等消费：重复投递直接丢弃
-      r.lastSeenSeq = m.seq;
-      // 自己发的消息：广播回包更新乐观插入的占位消息，不重复上屏
-      const own = m.clientMsgId ? r.msgs.findIndex((x) => x.clientMsgId === m.clientMsgId) : -1;
-      if (own >= 0) {
-        r.msgs[own] = { ...m, mine: true, pending: false };
-        r.pending.delete(m.clientMsgId);
-      } else {
-        r.msgs.push({ ...m, mine: m.from === me.userId });
-      }
-      if (r.msgs.length > 500) r.msgs.splice(0, r.msgs.length - 500);
-      store.save(); scheduleAck();
-      render();
-      break;
-    }
-    case 'ack': {                                  // 服务端确认我发的消息（含分配的 seq）
-      const r = rooms.get(m.roomId); if (!r) break;
-      const p = r.pending.get(m.clientMsgId);
-      if (p) p.acked = true;
-      const own = r.msgs.find((x) => x.clientMsgId === m.clientMsgId);
-      if (own) { own.pending = false; own.seq = m.seq; }
-      render();
-      break;
-    }
-    case 'sync_done':
-      if (m.hasMore) send({ type: 'sync', roomId: m.roomId, lastSeq: m.lastSeq });
-      break;
-    case 'notice': {
-      const r = rooms.get(m.roomId);
-      if (r && m.userId === me.userId) r.mutedUntil = m.event === 'muted' ? m.until : 0;
-      sys(m.roomId, m.event === 'muted' ? `有成员被禁言至 ${new Date(m.until).toLocaleTimeString()}` : '有成员被解除禁言');
-      refreshMembers();
-      break;
-    }
-    case 'members':
-      if (m.roomId === currentRoom) renderMembers(m.members);
-      break;
-    case 'error':
-      sys(currentRoom, `错误 [${m.code}] ${m.message}`);
-      break;
-    case 'server_shutdown': sys(currentRoom, '服务器即将重启…'); break;
-  }
-}
-
-function scheduleAck() {
-  if (ackTimer) return;
-  ackTimer = setTimeout(() => {
-    ackTimer = null;
-    for (const [id, r] of rooms) if (r.lastSeenSeq > 0) send({ type: 'ack', roomId: id, seq: r.lastSeenSeq });
-  }, 500);
-}
-
-function refreshMembers() { if (currentRoom) send({ type: 'members', roomId: currentRoom }); }
-setInterval(refreshMembers, 5000);
-
-// 未 ACK 的消息每秒重发一次（clientMsgId 不变，服务端幂等）
-retryTimer = setInterval(() => {
-  for (const [roomId, r] of rooms) {
-    for (const [cid, p] of r.pending) {
-      if (!p.acked && Date.now() - p.sentAt > 1000) {
-        p.sentAt = Date.now();
-        send({ type: 'msg', roomId, clientMsgId: cid, content: p.content });
-      }
-    }
-  }
-}, 1000);
-
-function sys(roomId, text) {
-  const r = rooms.get(roomId); if (!r) return;
-  r.msgs.push({ sys: text }); render();
+function sys(text) {
+  const r = session && session.rooms.get(session.activeRoomId);
+  if (!r) return;
+  r.msgs.push({ sys: text });
+  render();
 }
 
 function renderRooms() {
-  $('roomList').innerHTML = [...rooms].map(([id, r]) =>
-    `<div class="room ${id === currentRoom ? 'active' : ''}" data-id="${id}">
+  $('roomList').innerHTML = [...session.rooms].map(([id, r]) =>
+    `<div class="room ${id === session.activeRoomId ? 'active' : ''}" data-id="${id}">
        <span>${escapeHtml(r.name || id)}</span>
        <span class="badge">${r.role === 'admin' ? '管理员' : ''}</span>
      </div>`).join('');
   for (const el of $('roomList').children) {
-    el.onclick = () => { currentRoom = el.dataset.id; renderRooms(); render(); refreshMembers(); };
+    el.onclick = () => session.setActiveRoom(el.dataset.id);
   }
 }
 
 function render() {
-  const r = rooms.get(currentRoom);
+  const r = session.rooms.get(session.activeRoomId);
   $('composer').classList.toggle('hidden', !r);
   $('members').classList.toggle('hidden', !r);
   if (!r) return;
@@ -249,9 +144,8 @@ function render() {
   $('msgInput').disabled = muted;
 }
 
-// 把 members 响应接进渲染
 function renderMembers(list) {
-  const r = rooms.get(currentRoom); if (!r) return;
+  const r = session.rooms.get(session.activeRoomId); if (!r) return;
   $('members').innerHTML = '<b>成员</b>' + list.map((m) => {
     const muted = m.mutedUntil > Date.now();
     const adminBtns = r.role === 'admin' && m.userId !== me.userId && m.role !== 'admin'
@@ -267,9 +161,9 @@ function renderMembers(list) {
     b.onclick = () => {
       if (b.dataset.act === 'mute') {
         const mins = prompt('禁言时长（分钟）', '10');
-        if (mins) send({ type: 'mute', roomId: currentRoom, userId: b.dataset.uid, minutes: Number(mins) });
+        if (mins) session.mute(b.dataset.uid, Number(mins));
       } else {
-        send({ type: 'unmute', roomId: currentRoom, userId: b.dataset.uid });
+        session.unmute(b.dataset.uid);
       }
     };
   });
@@ -285,40 +179,58 @@ $('loginForm').onsubmit = async (e) => {
   e.preventDefault();
   const name = $('nameInput').value.trim(); if (!name) return;
   me = await login(name);
-  // 恢复房间进度
   const saved = store.load();
-  for (const [id, info] of Object.entries(saved)) {
-    rooms.set(id, { name: info.name, msgs: [], pending: new Map(), lastSeenSeq: info.lastSeenSeq || 0 });
-  }
+
+  session = new ChatSession({
+    url: `ws://${location.host}/ws?token=${encodeURIComponent(me.token)}`,
+    me,
+    saved,
+    persist: (snap) => store.save(snap),
+    onEvent(event, payload) {
+      if (event === 'status') {
+        if (payload.connected) setStatus('on', '已连接');
+        else if (payload.intentional) setStatus('off', '已退出');
+        else setStatus('off', `已断开，${payload.retryIn}ms 后重连…`);
+      } else if (event === 'rooms') {
+        renderRooms();
+      } else if (event === 'messages') {
+        if (!payload || payload.roomId === session.activeRoomId) render();
+      } else if (event === 'members') {
+        renderMembers(payload);
+      }
+    },
+  });
+  session.connect();
+
   $('loginForm').classList.add('hidden');
   $('roomPanel').classList.remove('hidden');
   $('who').textContent = `${me.name} (${me.userId})`;
-  connect();
 };
 
 $('createForm').onsubmit = (e) => {
   e.preventDefault();
   const name = $('roomInput').value.trim(); if (!name) return;
-  send({ type: 'create_room', name });
+  session.createRoom(name);
   $('roomInput').value = '';
 };
 
 $('joinBtn').onclick = () => {
   const name = prompt('输入要加入的房间名');
-  if (name) send({ type: 'join', room: name, lastSeq: 0 });
+  if (name) session.joinRoom(name, 0);
 };
 
 $('composer').onsubmit = (e) => {
   e.preventDefault();
-  const content = $('msgInput').value.trim(); if (!content || !currentRoom) return;
-  const cid = crypto.randomUUID();
-  const r = rooms.get(currentRoom);
-  r.pending.set(cid, { content, sentAt: Date.now(), acked: false });
-  r.msgs.push({ mine: true, fromName: me.name, content, seq: '…', pending: true, clientMsgId: cid });
-  send({ type: 'msg', roomId: currentRoom, clientMsgId: cid, content });
+  const content = $('msgInput').value.trim();
+  if (!content) return;
+  session.postMessage(content);
   $('msgInput').value = '';
-  render();
 };
+
+// 页面卸载：唯一的会话销毁入口，取消重连/ACK/重发/成员刷新全部定时器并解绑监听器
+function onUnload() { if (session) session.shutdown(); }
+window.addEventListener('beforeunload', onUnload);
+window.addEventListener('pagehide', onUnload);
 </script>
 </body>
 </html>

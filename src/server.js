@@ -29,7 +29,7 @@ const fail = (code, message) => {
   throw new ChatError(code, message);
 };
 
-/** 令牌桶限流（按用户），防刷屏 */
+/** 令牌桶限流（按用户），防刷屏。闲置桶定时回收，避免长期运行后 key 无限增长 */
 class TokenBucket {
   constructor(ratePerSec, burst) {
     this.rate = ratePerSec;
@@ -48,6 +48,14 @@ class TokenBucket {
     if (b.tokens < 1) return false;
     b.tokens -= 1;
     return true;
+  }
+
+  /** 删除闲置超过 idleMs 的桶 */
+  prune(idleMs) {
+    const t = now();
+    for (const [key, b] of this.buckets) {
+      if (t - b.updated > idleMs) this.buckets.delete(key);
+    }
   }
 }
 
@@ -345,12 +353,38 @@ function createChatServer(overrides = {}) {
 
   const wss = new WebSocketServer({ noServer: true });
 
+  /**
+   * 注册一条新连接：进 Hub 索引 + 绑定事件监听器。
+   * 集中在一处完成，使「索引」与「带 close 清理的监听器」永远成对出现，
+   * 杜绝升级回调异常时产生没有清理者的僵尸连接。
+   */
+  function registerConnection(ws, user) {
+    const conn = new Connection(ws, user);
+    hub.add(conn);
+    conn.bindListeners({
+      pong: () => { conn.lastPong = now(); },
+      message: (raw) => onFrame(conn, raw),
+      // 所有终止路径（正常关闭、error 后随附的 close、心跳/重发超时 terminate）
+      // 都汇聚到 hub.remove —— 内部 destroyed 守卫保证只清理一次
+      close: () => hub.remove(conn),
+      error: () => { /* error 后必随 close，统一在 close 清理 */ },
+    });
+    return conn;
+  }
+
   httpServer.on('upgrade', (req, socket, head) => {
     const reject = (code, text) => {
-      socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\n\r\n`);
+      try {
+        socket.write(`HTTP/1.1 ${code} ${text}\r\nConnection: close\r\n\r\n`);
+      } catch { /* 对端可能已关闭，destroy 兜底 */ }
       socket.destroy();
     };
-    const url = new URL(req.url, 'http://localhost');
+    let url;
+    try {
+      url = new URL(req.url, 'http://localhost');
+    } catch {
+      return reject(400, 'Bad Request');
+    }
     if (url.pathname !== '/ws') return reject(404, 'Not Found');
 
     const userId = verifyToken(url.searchParams.get('token'), config.authSecret);
@@ -360,19 +394,23 @@ function createChatServer(overrides = {}) {
     const denied = hub.checkAdmission(user.id);
     if (denied) return reject(503, denied);
 
-    wss.handleUpgrade(req, socket, head, (ws) => {
-      const conn = new Connection(ws, user);
-      hub.add(conn);
-
-      ws.on('pong', () => {
-        conn.lastPong = now();
+    // 升级失败（回调内异常）时绝不能留下「已入索引但无人清理」的连接
+    try {
+      wss.handleUpgrade(req, socket, head, (ws) => {
+        let conn;
+        try {
+          conn = registerConnection(ws, user);
+        } catch (err) {
+          console.error('[upgrade] connection init failed', err);
+          try { ws.terminate(); } catch { /* 已关闭 */ }
+          return;
+        }
+        hub.send(conn, { type: 'welcome', userId: user.id, name: user.name, serverTime: now() });
       });
-      ws.on('message', (raw) => onFrame(conn, raw));
-      ws.on('close', () => hub.remove(conn));
-      ws.on('error', () => {}); // 错误后必随 close，统一在 close 清理
-
-      hub.send(conn, { type: 'welcome', userId: user.id, name: user.name, serverTime: now() });
-    });
+    } catch (err) {
+      console.error('[upgrade] handleUpgrade failed', err);
+      reject(500, 'Internal Server Error');
+    }
   });
 
   // ---------------------------------------------------------------- 定时任务
@@ -380,33 +418,51 @@ function createChatServer(overrides = {}) {
   const timers = [
     setInterval(() => hub.heartbeatSweep(), config.heartbeatIntervalMs),
     setInterval(() => hub.resendSweep(), config.ackResendIntervalMs),
+    setInterval(() => limiter.prune(config.rateLimitIdleMs), config.rateLimitPruneIntervalMs),
   ];
   for (const t of timers) t.unref();
 
   // ---------------------------------------------------------------- 生命周期
 
+  let stopped = false;
+
   function start() {
-    return new Promise((resolve) => {
+    return new Promise((resolve, reject) => {
       httpServer.listen(config.port, config.host, () => {
         const addr = httpServer.address();
         console.log(`[chat] listening on http://${addr.address}:${addr.port}  (db: ${config.dbPath})`);
         resolve(addr);
       });
+      httpServer.once('error', reject);
     });
   }
 
+  /**
+   * 停止服务（幂等，可被 SIGINT/SIGTERM/测试重复调用）。
+   * 清理顺序：停定时器 → 逐连接通知并同步摘除（Hub 索引、ws 监听器、unacked、
+   * ws 引用一次清完）→ 关 WS/HTTP 服务 → 关数据库。
+   */
   function stop() {
+    if (stopped) return;
+    stopped = true;
     for (const t of timers) clearInterval(t);
+    timers.length = 0;
+
     for (const conn of [...hub.all]) {
-      hub.send(conn, { type: 'server_shutdown' });
-      conn.ws.terminate();
+      try { hub.send(conn, { type: 'server_shutdown' }); } catch { /* 忽略 */ }
+      const ws = conn.ws; // release() 会清空 ws 引用，terminate 要先留一份
+      hub.remove(conn); // 同步完成全部连接级清理（幂等）
+      if (ws) {
+        try { ws.terminate(); } catch { /* 已关闭 */ }
+      }
     }
+
     wss.close();
-    httpServer.close();
+    if (httpServer.listening) httpServer.close();
     db.close();
   }
 
-  return { config, db, hub, httpServer, wss, start, stop };
+  return { config, db, hub, limiter, timers, httpServer, wss, start, stop };
 }
 
 // 直接运行：node src/server.js

@@ -31,6 +31,8 @@ module.exports = {
   // 发送限流（令牌桶，按用户）
   rateLimitPerSec: Number(process.env.RATE_LIMIT_PER_SEC || 10),
   rateLimitBurst: Number(process.env.RATE_LIMIT_BURST || 20),
+  rateLimitIdleMs: Number(process.env.RATE_LIMIT_IDLE_MS || 10 * 60_000), // 桶闲置多久后回收
+  rateLimitPruneIntervalMs: Number(process.env.RATE_LIMIT_PRUNE_INTERVAL_MS || 60_000),
 
   // 演示用鉴权：token 签名密钥（生产环境务必替换）
   authSecret: process.env.AUTH_SECRET || 'dev-secret-change-me',
